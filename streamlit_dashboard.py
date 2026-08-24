@@ -57,6 +57,17 @@ def generate_demo_data():
     ])
 
 
+def robust_stats(series):
+    """Mean/std that ignore extreme spikes (e.g. promo days, holiday surges)
+    so a handful of outlier days don't blow up the safety-stock formula."""
+    s = series.dropna()
+    if len(s) < 5:
+        return s.mean(), s.std()
+    lo, hi = s.quantile(0.05), s.quantile(0.95)
+    clipped = s.clip(lo, hi)
+    return clipped.mean(), clipped.std()
+
+
 st.sidebar.header("Data")
 uploaded = st.sidebar.file_uploader("Upload your CSV", type=["csv"])
 
@@ -90,8 +101,7 @@ sub = df[(df["Store ID"] == store) & (df["Product ID"] == product)].sort_values(
 sub["MA_7"] = sub["Units Sold"].rolling(7).mean()
 sub["MA_30"] = sub["Units Sold"].rolling(30).mean()
 
-avg_daily = sub["Units Sold"].mean()
-std_daily = sub["Units Sold"].std()
+avg_daily, std_daily = robust_stats(sub["Units Sold"])
 safety_stock = service_z * std_daily * np.sqrt(lead_time)
 reorder_point = avg_daily * lead_time + safety_stock
 current_inventory = sub["Inventory Level"].iloc[-1] if "Inventory Level" in sub else np.nan
@@ -133,23 +143,27 @@ st.subheader(f"Inventory runway — {store}")
 runway_rows = []
 for p in products_in_store:
     p_df = df[(df["Store ID"] == store) & (df["Product ID"] == p)].sort_values("Date")
-    p_avg = p_df["Units Sold"].mean()
-    p_std = p_df["Units Sold"].std()
+    p_avg, p_std = robust_stats(p_df["Units Sold"])
     p_ss = service_z * p_std * np.sqrt(lead_time)
     p_rop = p_avg * lead_time + p_ss
     p_current = p_df["Inventory Level"].iloc[-1] if "Inventory Level" in p_df else np.nan
     status = "Reorder now" if p_current <= p_rop else ("Watch" if p_current <= p_rop * 1.25 else "OK")
     runway_rows.append({
-        "Product": p, "Current Inventory": round(p_current, 0),
-        "Reorder Point": round(p_rop, 0), "Status": status
+        "Product": p, "Current Inventory": int(round(p_current, 0)),
+        "Reorder Point": int(round(p_rop, 0)), "Status": status
     })
 
 runway_df = pd.DataFrame(runway_rows)
 
 
 def highlight_status(row):
-    color = "#F5DCD4" if row["Status"] == "Reorder now" else "#F3E4CB" if row["Status"] == "Watch" else "#DCEAE6"
-    return [f"background-color: {color}"] * len(row)
+    if row["Status"] == "Reorder now":
+        bg, text = "#F5DCD4", "#7A2A16"
+    elif row["Status"] == "Watch":
+        bg, text = "#F3E4CB", "#7A5310"
+    else:
+        bg, text = "#DCEAE6", "#1E4A42"
+    return [f"background-color: {bg}; color: {text}; font-weight: 500"] * len(row)
 
 
 st.dataframe(runway_df.style.apply(highlight_status, axis=1), use_container_width=True, hide_index=True)
