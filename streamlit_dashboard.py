@@ -59,8 +59,9 @@ st.set_page_config(page_title="Supply Chain Dashboard", layout="wide")
 # ----------------------------------------------------------------------------
 CANDIDATE_COLUMNS = {
     "Date": ["date", "order date", "week", "day", "period"],
-    "Store ID": ["store id", "store", "location", "shop", "outlet", "warehouse"],
-    "Product ID": ["product id", "product", "sku", "item id", "item"],
+    "Store ID": ["store id", "store_id", "storeid", "store", "location", "shop", "outlet",
+                 "warehouse", "branch", "region"],
+    "Product ID": ["product id", "product_id", "productid", "product", "sku", "item id", "item"],
     "Units Sold": ["units sold", "sales", "demand", "qty sold", "quantity sold", "sold", "sales qty"],
     "Inventory Level": ["inventory level", "inventory", "stock", "on hand", "stock level", "on-hand"],
     "Units Ordered": ["units ordered", "ordered", "replenishment", "reorder qty", "purchase qty", "po qty"],
@@ -122,24 +123,52 @@ def generate_demo_data():
 st.sidebar.header("Data")
 uploaded = st.sidebar.file_uploader("Upload your CSV", type=["csv"])
 
+SELECT_PLACEHOLDER = "— select a column —"
+
 if uploaded is not None:
     raw = pd.read_csv(uploaded)
     is_demo = False
 
     st.sidebar.subheader("Map your columns")
-    st.sidebar.caption("Auto-detected where possible - check these are right.")
+    st.sidebar.caption("Auto-detected where confident - please confirm these are right before continuing.")
     mapping = {}
     actual_cols = list(raw.columns)
     for field in REQUIRED_FIELDS:
         guess = guess_column(field, actual_cols)
-        idx = actual_cols.index(guess) if guess in actual_cols else 0
-        mapping[field] = st.sidebar.selectbox(f"{field} *", actual_cols, index=idx, key=f"map_{field}")
+        options = [SELECT_PLACEHOLDER] + actual_cols
+        # Only pre-select a real column if we found a genuine match - never
+        # silently default to "whatever column happens to be first in the
+        # file" for a required field. A wrong required-field guess corrupts
+        # every downstream number, so an unconfident guess must force the
+        # user to actively choose rather than picking for them.
+        idx = options.index(guess) if guess in actual_cols else 0
+        choice = st.sidebar.selectbox(f"{field} *", options, index=idx, key=f"map_{field}")
+        mapping[field] = None if choice == SELECT_PLACEHOLDER else choice
     for field in OPTIONAL_FIELDS:
         guess = guess_column(field, actual_cols)
         options = ["(none)"] + actual_cols
         idx = options.index(guess) if guess in actual_cols else 0
         choice = st.sidebar.selectbox(field, options, index=idx, key=f"map_{field}")
         mapping[field] = None if choice == "(none)" else choice
+
+    # Validate before doing anything else with the data. Two failure modes
+    # to catch explicitly rather than let silently corrupt every downstream
+    # number: a required field left unmapped, or two different fields
+    # accidentally pointing at the same source column (e.g. Store ID and
+    # Category both mapped to "Category").
+    missing_required = [f for f in REQUIRED_FIELDS if mapping.get(f) is None]
+    chosen = [c for c in mapping.values() if c is not None]
+    duplicates = sorted({c for c in chosen if chosen.count(c) > 1})
+
+    if missing_required:
+        st.error(f"Please map the required column(s) in the sidebar: {', '.join(missing_required)}.")
+        st.stop()
+    if duplicates:
+        st.error(
+            f"These source column(s) are mapped to more than one field, which will corrupt the numbers: "
+            f"**{', '.join(duplicates)}**. Please make each field in the sidebar point to a different column."
+        )
+        st.stop()
 
     df = pd.DataFrame()
     for canonical, source_col in mapping.items():
@@ -375,23 +404,92 @@ if frac_reorder > 0.6 and pd.notna(median_cover_days):
     )
 
 # ----------------------------------------------------------------------------
-# 4. Layout - header KPIs for the whole network
+# 4. Layout - plain-English summary first, for anyone skimming
 # ----------------------------------------------------------------------------
 st.title("Demand & Inventory Dashboard")
 st.caption("Supply chain analytics - demand forecasting, safety stock, reorder points & $ risk")
 if not has_price:
     st.caption(f"No price column found - using an assumed unit cost of ${unit_cost:,.2f} for all $ estimates (editable in the sidebar).")
 
-n_reorder = (portfolio["Status"] == "Reorder now").sum()
-n_watch = (portfolio["Status"] == "Watch").sum()
+n_reorder = int((portfolio["Status"] == "Reorder now").sum())
+n_watch = int((portfolio["Status"] == "Watch").sum())
+n_ok = int((portfolio["Status"] == "OK").sum())
+n_total = len(portfolio)
 total_stockout_risk = portfolio["Est. Stockout Cost ($)"].sum()
 total_holding_cost = portfolio["Holding Cost/yr ($)"].sum()
 
+# --- Executive summary: written for someone with 30 seconds and no supply
+# chain background - the KPIs and jargon-heavy tables below are for anyone
+# who wants to dig in, but this paragraph should stand alone.
+top_risk = portfolio.sort_values("Est. Stockout Cost ($)", ascending=False).iloc[0] if n_total else None
+worst_segment = (
+    portfolio[portfolio["Status"] == "Reorder now"]["Segment"].value_counts().idxmax()
+    if n_reorder > 0 else None
+)
+summary_bits = [
+    f"This dashboard tracks **{n_total} product/store combinations**. Right now, **{n_reorder} need a "
+    f"purchase order placed immediately**, **{n_watch} should be watched closely**, and **{n_ok} are healthy**."
+]
+if total_stockout_risk > 0:
+    summary_bits.append(
+        f"If the urgent items aren't restocked, we estimate roughly **${total_stockout_risk:,.0f}** in lost-sale "
+        f"risk across the network."
+    )
+if top_risk is not None and top_risk["Status"] != "OK":
+    summary_bits.append(
+        f"The single biggest risk right now is **{top_risk['Product ID']}** at **{top_risk['Store ID']}** "
+        f"(~${top_risk['Est. Stockout Cost ($)']:,.0f} at risk)."
+    )
+if worst_segment:
+    summary_bits.append(
+        f"Most urgent items fall in segment **{worst_segment}** (A/B/C = how much revenue a product drives, "
+        f"X/Y/Z = how unpredictable its demand is - a 'Z' means demand swings a lot day to day, which is why "
+        f"it's harder to keep in stock)."
+    )
+st.info("**In plain English:** " + " ".join(summary_bits))
+
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("SKUs needing reorder now", int(n_reorder))
-k2.metric("SKUs to watch", int(n_watch))
+k1.metric("SKUs needing reorder now", n_reorder)
+k2.metric("SKUs to watch", n_watch)
 k3.metric("Est. stockout $ at risk", f"${total_stockout_risk:,.0f}")
 k4.metric("Annual safety-stock holding cost", f"${total_holding_cost:,.0f}")
+
+# --- Forward-looking recommendations: broader than any single SKU, meant
+# to read like advice a consultant would leave behind, not just a status
+# report of what's currently on fire.
+st.markdown("#### Recommended next steps")
+recs = []
+frac_reorder_all = n_reorder / n_total if n_total else 0
+z_share = (portfolio["Variability (XYZ)"].str.startswith("Z")).mean() if n_total else 0
+az_bz_count = portfolio["Segment"].isin(["AZ", "BZ"]).sum()
+
+if frac_reorder_all > 0.3:
+    recs.append(
+        f"**Reduce supplier lead time or review order frequency.** {frac_reorder_all*100:.0f}% of SKUs are "
+        f"flagged urgent at once - that's usually a sign the replenishment cycle (lead time + order size) is "
+        f"too tight for how fast stock moves, not that every product independently went wrong."
+    )
+if az_bz_count > 0:
+    recs.append(
+        f"**Give the {az_bz_count} high-value, high-volatility (AZ/BZ) SKUs closer, more frequent review** "
+        f"instead of the same flat reorder rule as everything else - they drive real revenue and are the "
+        f"hardest to forecast well, so they carry the most downside if mismanaged."
+    )
+if total_holding_cost > total_stockout_risk * 2 and total_stockout_risk > 0:
+    recs.append(
+        "**Consider trimming the order-up-to buffer.** Estimated holding cost is well above estimated stockout "
+        "risk right now, which can mean more cash is tied up in safety stock than the actual risk justifies."
+    )
+elif total_stockout_risk > total_holding_cost * 2 and total_holding_cost > 0:
+    recs.append(
+        "**Consider increasing the order-up-to buffer for urgent SKUs.** Estimated stockout risk is well above "
+        "estimated holding cost, suggesting it's currently cheaper to carry a bit more stock than to risk running out."
+    )
+if not recs:
+    recs.append("No major red flags at the network level under current assumptions - spot-check the priority table below for individual SKUs.")
+for r in recs:
+    st.markdown(f"- {r}")
+st.caption("These are generated from the current sidebar assumptions (lead time, service level, order-up-to buffer) - adjust them to stress-test the picture.")
 
 # ----------------------------------------------------------------------------
 # 5. Portfolio view - what to look at first, across the whole network
@@ -466,9 +564,9 @@ c5.metric("Days of Cover", f"{days_of_cover:.1f}",
           delta=None if pd.isna(days_of_cover) else f"{'below' if days_of_cover < lead_time else 'ok'} lead time")
 
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=sub["Date"], y=sub["Units Sold"], name="Actual",
+fig.add_trace(go.Scatter(x=sub["Date"], y=sub["Units Sold"], name="Actual daily sales",
                           line=dict(color="#8891A0", width=1), opacity=0.5))
-fig.add_trace(go.Scatter(x=sub["Date"], y=sub["MA_7"], name="7-day avg",
+fig.add_trace(go.Scatter(x=sub["Date"], y=sub["MA_7"], name="7-day average",
                           line=dict(color="#2C6E63", width=2)))
 fig.add_trace(go.Scatter(x=future_dates, y=forecast_vals, name=f"{forecast_horizon}-day forecast",
                           line=dict(color="#28344A", width=2, dash="dash")))
@@ -476,13 +574,25 @@ fig.add_trace(go.Scatter(
     x=list(future_dates) + list(future_dates[::-1]),
     y=list(forecast_vals + resid_std) + list((forecast_vals - resid_std)[::-1]),
     fill="toself", fillcolor="rgba(40,52,74,0.12)", line=dict(color="rgba(0,0,0,0)"),
-    name="Forecast uncertainty", hoverinfo="skip",
+    name="Forecast uncertainty range", hoverinfo="skip",
 ))
 fig.add_hline(y=reorder_point, line_dash="dot", line_color="#B23A20",
-              annotation_text="Reorder point", annotation_position="top left")
-fig.update_layout(height=400, margin=dict(l=10, r=10, t=10, b=10),
-                   plot_bgcolor="white", paper_bgcolor="white", legend=dict(orientation="h", y=1.1))
-st.plotly_chart(fig, use_container_width=True)
+              annotation_text="Reorder point", annotation_position="bottom right",
+              annotation_font=dict(size=13, color="#B23A20"),
+              annotation_bgcolor="rgba(255,255,255,0.85)")
+fig.update_layout(
+    height=430, margin=dict(l=10, r=10, t=10, b=10),
+    plot_bgcolor="white", paper_bgcolor="white",
+    legend=dict(orientation="h", yanchor="bottom", y=-0.35, x=0, font=dict(size=12)),
+    font=dict(size=13),
+)
+st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+st.caption(
+    "**How to read this:** gray = actual daily sales. Dark green = 7-day rolling average (smooths out "
+    "day-to-day noise so the trend is visible). Dashed navy = the forecast for the next "
+    f"{forecast_horizon} days. Shaded band = how uncertain that forecast is - wider means less confident. "
+    "Red dotted line = reorder point: the stock level at which a new purchase order should go out."
+)
 
 st.markdown(f"**Simulated inventory position under an assumed reorder policy** (s={reorder_point:.0f}, S={order_up_to:.0f})")
 st.caption(
@@ -491,14 +601,27 @@ st.caption(
     "inventory fields don't reliably reflect a real depleting/replenishing balance (see limitations below)."
 )
 fig2 = go.Figure()
-fig2.add_trace(go.Scatter(x=sub["Date"], y=sub["Simulated Inventory"], name="Simulated inventory",
+fig2.add_trace(go.Scatter(x=sub["Date"], y=sub["Simulated Inventory"], name="Simulated stock on hand",
                            line=dict(color="#2C6E63", width=1.5), fill="tozeroy", fillcolor="rgba(44,110,99,0.10)"))
 fig2.add_hline(y=reorder_point, line_dash="dot", line_color="#B23A20",
-               annotation_text="Reorder point (s)", annotation_position="top left")
-fig2.add_hline(y=order_up_to, line_dash="dash", line_color="#8891A0",
-               annotation_text="Order-up-to (S)", annotation_position="top left")
-fig2.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="white", paper_bgcolor="white")
-st.plotly_chart(fig2, use_container_width=True)
+               annotation_text="Reorder point (s)", annotation_position="bottom right",
+               annotation_font=dict(size=13, color="#B23A20"),
+               annotation_bgcolor="rgba(255,255,255,0.85)")
+fig2.add_hline(y=order_up_to, line_dash="dash", line_color="#5B6472",
+               annotation_text="Order-up-to (S)", annotation_position="top right",
+               annotation_font=dict(size=13, color="#5B6472"),
+               annotation_bgcolor="rgba(255,255,255,0.85)")
+fig2.update_layout(
+    height=300, margin=dict(l=10, r=10, t=30, b=10),
+    plot_bgcolor="white", paper_bgcolor="white", font=dict(size=13), showlegend=False,
+)
+st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+st.caption(
+    "**How to read this:** the green sawtooth is simulated stock on hand - it drops as items sell and jumps "
+    "back up when a restock arrives. Red dotted line = reorder point (order more once stock falls to here). "
+    "Gray dashed line = order-up-to level (how much a restock brings inventory back to). Time spent below the "
+    "red line means this SKU is currently waiting on a purchase order."
+)
 
 # ----------------------------------------------------------------------------
 # 8. Plain-English recommendation (this is the part a manager actually reads)
