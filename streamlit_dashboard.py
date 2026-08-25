@@ -19,14 +19,25 @@ if it's missing.
 Design notes (why this file is built the way it is - kept as comments
 so this reads like reasoning, not just code):
 
-  * "Inventory Level" columns in most public retail datasets (incl. the
-    Kaggle "Retail Store Inventory Forecasting Dataset") are generated
-    independently of Units Sold / Units Ordered - they don't actually
-    behave like a depleting stock balance. Trusting that column directly
-    causes nonsense reorder signals (e.g. every SKU flagged "reorder now").
-    So we IGNORE the raw inventory column for decision-making and instead
-    simulate a running balance from Units Sold / Units Ordered, seeded
-    from the raw column's first value if available. See simulate_inventory().
+  * "Inventory Level" and "Units Ordered" columns in most public retail
+    datasets (incl. the Kaggle "Retail Store Inventory Forecasting
+    Dataset") turn out not to behave like a real depleting/replenishing
+    stock balance - they're generated independently of each other and of
+    Units Sold. Verified this two ways: (1) reconstructing a cumulative
+    balance from them collapses to zero for most SKUs, meaning Units
+    Ordered doesn't track real restocking; (2) even trusting the raw
+    Inventory Level column directly, its typical scale (often only ~1-2
+    days of average demand) is structurally too low to ever clear a
+    realistic lead-time + safety-stock reorder point, regardless of what
+    lead time is assumed - so literally every SKU gets flagged, which is
+    a data-compatibility problem, not a real network-wide crisis.
+    Rather than force a broken assumption onto data that doesn't support
+    it, this app SIMULATES inventory forward from each SKU's real demand
+    history under an explicit, stated (s, S) reorder-point policy. See
+    simulate_policy_inventory(). This is a deliberate, disclosed choice:
+    "Current Inventory" here means "what inventory would look like under
+    this stated policy, given your real demand" - not a reported fact
+    from the source file.
 
   * "Demand forecasting" needs an actual forward-looking prediction, not
     just a trailing moving average. See forecast_demand() - a simple,
@@ -154,13 +165,45 @@ products_in_store = sorted(df[df["Store ID"] == store]["Product ID"].unique())
 product = st.sidebar.selectbox("Product", products_in_store)
 
 st.sidebar.header("Assumptions")
-lead_time = st.sidebar.number_input("Lead time (days)", min_value=1, max_value=60, value=5)
+
+# Data-driven default lead time: hardcoding "5 days" (fine for the built-in
+# demo data) breaks on real datasets where on-hand inventory only ever
+# covers a day or two of demand - every SKU ends up flagged "reorder now"
+# not because anything is wrong, but because the lead-time assumption
+# doesn't match how that dataset represents stock. So: estimate typical
+# days of on-hand cover from the data itself and use that as the default,
+# while still letting the user override it if they know the real supplier
+# lead time.
+if df["Inventory Level"].notna().any():
+    per_sku_cover = df.groupby(["Store ID", "Product ID"]).agg(
+        inv_mean=("Inventory Level", "mean"), sold_mean=("Units Sold", "mean")
+    )
+    per_sku_cover["cover_days"] = per_sku_cover["inv_mean"] / per_sku_cover["sold_mean"].replace(0, np.nan)
+    median_cover = per_sku_cover["cover_days"].median(skipna=True)
+    suggested_lead_time = int(np.clip(round(median_cover), 1, 30)) if pd.notna(median_cover) else 5
+else:
+    suggested_lead_time = 5
+
+lead_time = st.sidebar.number_input("Lead time (days)", min_value=1, max_value=60, value=suggested_lead_time)
+st.sidebar.caption(
+    f"Defaulted to {suggested_lead_time} day(s), estimated from typical on-hand cover in your data "
+    "(median Inventory Level ÷ average daily demand, across all SKUs). Override if you know the real "
+    "supplier lead time - just be aware a lead time much longer than typical on-hand cover will flag "
+    "most SKUs as needing reorder, since the data itself never carries that much buffer stock."
+)
 service_z = st.sidebar.selectbox(
     "Service level", [1.28, 1.65, 2.05],
     format_func=lambda z: f"{z} (~{'90%' if z == 1.28 else '95%' if z == 1.65 else '98%'})",
     index=1,
 )
 forecast_horizon = st.sidebar.slider("Forecast horizon (days)", 7, 60, 30)
+order_multiplier = st.sidebar.slider(
+    "Order-up-to buffer (x lead-time demand)", 1.0, 4.0, 1.5, step=0.5
+)
+st.sidebar.caption(
+    "Controls how much extra stock is ordered above the reorder point each cycle. Lower = leaner but more "
+    "frequent reorder flags, especially for volatile SKUs. Higher = fewer urgent flags but more holding cost."
+)
 
 st.sidebar.subheader("Cost assumptions")
 st.sidebar.caption("Used for $ risk estimates - override if you know real figures.")
@@ -185,42 +228,50 @@ def robust_stats(series):
     return clipped.mean(), clipped.std()
 
 
-def simulate_inventory(sub):
-    """Recompute a running inventory balance from Units Sold / Units Ordered
-    instead of trusting a raw 'Inventory Level' column, since in many public
-    datasets that column is generated independently and doesn't actually
-    track depletion/replenishment.
+def simulate_policy_inventory(dates, demand, lead_time, service_z, avg_daily, std_daily, order_multiplier=1.5):
+    """Simulate on-hand inventory forward from REAL demand under an explicit
+    (s, S) reorder-point policy, rather than trusting the source file's
+    Inventory Level / Units Ordered columns (see design notes at top of
+    file for why those can't be trusted across most public datasets).
 
-    This is only valid if Units Ordered in the source data actually behaves
-    like real restocking (i.e. roughly offsets Units Sold over time). If it
-    doesn't - e.g. it's sparse or independently-random noise, as can happen
-    in synthetic Kaggle-style datasets - the cumulative balance will just
-    collapse to 0 for almost every SKU, which is a different-looking but
-    equally broken signal. So: build the simulation, then check whether it
-    actually behaves like inventory before trusting it. If it doesn't, fall
-    back to the raw column and say so explicitly rather than silently
-    presenting a confident-looking but meaningless number."""
-    sub = sub.sort_values("Date").copy()
-    has_raw = sub["Inventory Level"].notna().any()
-    start = sub["Inventory Level"].dropna().iloc[0] if has_raw else sub["Units Sold"].mean() * 14
-    units_ordered = sub["Units Ordered"].fillna(0)
-    net_change = units_ordered - sub["Units Sold"].fillna(0)
-    simulated = (start + net_change.cumsum()).clip(lower=0)
+    s (reorder point)  = lead-time demand + safety stock, same formula used
+                          everywhere else in this app.
+    S (order-up-to)     = s + order_multiplier x one lead-time's worth of
+                          average demand. order_multiplier is a user-facing
+                          lever: too small and volatile SKUs spend most of
+                          their time flagged "reorder now" simply because
+                          each order barely covers one cycle; larger values
+                          trade more holding cost for fewer urgent flags.
 
-    frac_at_floor = (simulated == 0).mean()
-    if has_raw and frac_at_floor > 0.5:
-        # Simulation collapsed to the zero floor for most of the history -
-        # Units Ordered isn't tracking real replenishment in this dataset.
-        # Trust the raw column instead, but flag it as unverified.
-        sub["Simulated Inventory"] = sub["Inventory Level"]
-        sub["Inventory Method"] = "raw column (unverified - replenishment data looked inconsistent)"
-    elif has_raw:
-        sub["Simulated Inventory"] = simulated
-        sub["Inventory Method"] = "simulated from Units Sold / Units Ordered"
-    else:
-        sub["Simulated Inventory"] = simulated
-        sub["Inventory Method"] = "simulated (no raw inventory column in source data)"
-    return sub
+    Mechanics: inventory depletes by that day's actual demand. Whenever it
+    drops to/below s, a replenishment order for (S - inventory) is placed
+    and arrives `lead_time` days later. Simplification: only one order can
+    be in transit at a time (reasonable for a single-supplier, single-lead-
+    time model; noted as a limitation in the UI).
+
+    Returns the day-by-day simulated inventory array plus s and S, so the
+    detail view can plot the resulting sawtooth alongside the reorder
+    point line.
+    """
+    n = len(demand)
+    demand = np.nan_to_num(np.asarray(demand, dtype=float), nan=0.0)
+    s = avg_daily * lead_time + service_z * (std_daily or 0) * np.sqrt(lead_time)
+    S = s + avg_daily * lead_time * order_multiplier
+    inv = S  # assume the SKU starts fully stocked
+    pending = None  # (arrival_index, qty) - at most one order in transit
+    levels = np.empty(n)
+    for i in range(n):
+        if pending is not None and pending[0] == i:
+            inv += pending[1]
+            pending = None
+        inv = max(inv - demand[i], 0.0)
+        if inv <= s and pending is None:
+            qty = max(S - inv, 0.0)
+            arrival = i + lead_time
+            if arrival < n:
+                pending = (arrival, qty)
+        levels[i] = inv
+    return levels, s, S
 
 
 def forecast_demand(sub, horizon):
@@ -253,15 +304,17 @@ def forecast_demand(sub, horizon):
 
 
 @st.cache_data(show_spinner=False)
-def compute_all_sku_metrics(df, lead_time, service_z, unit_cost_default, holding_rate, stockout_mult, has_price):
+def compute_all_sku_metrics(df, lead_time, service_z, unit_cost_default, holding_rate, stockout_mult, has_price, order_multiplier):
     """One pass over every Store/Product combo - powers the portfolio view."""
     rows = []
     for (s, p), grp in df.groupby(["Store ID", "Product ID"]):
-        grp = simulate_inventory(grp)
+        grp = grp.sort_values("Date")
         avg_daily, std_daily = robust_stats(grp["Units Sold"])
+        levels, reorder_point, order_up_to = simulate_policy_inventory(
+            grp["Date"].to_numpy(), grp["Units Sold"].to_numpy(), lead_time, service_z, avg_daily, std_daily, order_multiplier
+        )
         safety_stock = service_z * (std_daily or 0) * np.sqrt(lead_time)
-        reorder_point = avg_daily * lead_time + safety_stock
-        current_inv = grp["Simulated Inventory"].iloc[-1]
+        current_inv = levels[-1]
         days_of_cover = current_inv / avg_daily if avg_daily > 0 else np.nan
 
         if avg_daily > 0:
@@ -304,7 +357,22 @@ def compute_all_sku_metrics(df, lead_time, service_z, unit_cost_default, holding
     return out
 
 
-portfolio = compute_all_sku_metrics(df, lead_time, service_z, unit_cost, holding_rate, stockout_margin_multiplier, has_price)
+portfolio = compute_all_sku_metrics(df, lead_time, service_z, unit_cost, holding_rate, stockout_margin_multiplier, has_price, order_multiplier)
+
+# Self-check: even with a simulated policy, if almost everything still
+# flags, say so explicitly rather than silently presenting numbers that
+# all look alarming (e.g. can happen with very bursty/volatile demand
+# pushing safety stock requirements very high across the board).
+frac_reorder = (portfolio["Status"] == "Reorder now").mean()
+median_cover_days = portfolio["Days of Cover"].median(skipna=True)
+if frac_reorder > 0.6 and pd.notna(median_cover_days):
+    st.warning(
+        f"⚠️ {frac_reorder * 100:.0f}% of SKUs are flagged **Reorder now** under a {lead_time}-day lead time, "
+        f"current service-level, and {order_multiplier}x order-up-to buffer. Median simulated days of cover across "
+        f"the network is **{median_cover_days:.1f} days**. If this feels too aggressive, try a shorter lead time, "
+        f"a lower service level, or a larger order-up-to buffer in the sidebar - high-CV demand combined with a "
+        f"tight order-up-to buffer means a SKU spends most of its cycle below the reorder point by construction."
+    )
 
 # ----------------------------------------------------------------------------
 # 4. Layout - header KPIs for the whole network
@@ -376,13 +444,15 @@ st.divider()
 st.subheader(f"{product} - {store} - detail view")
 
 sub = df[(df["Store ID"] == store) & (df["Product ID"] == product)].sort_values("Date")
-sub = simulate_inventory(sub)
 sub["MA_7"] = sub["Units Sold"].rolling(7).mean()
 
 avg_daily, std_daily = robust_stats(sub["Units Sold"])
+sim_levels, reorder_point, order_up_to = simulate_policy_inventory(
+    sub["Date"].to_numpy(), sub["Units Sold"].to_numpy(), lead_time, service_z, avg_daily, std_daily, order_multiplier
+)
+sub["Simulated Inventory"] = sim_levels
 safety_stock = service_z * (std_daily or 0) * np.sqrt(lead_time)
-reorder_point = avg_daily * lead_time + safety_stock
-current_inventory = sub["Simulated Inventory"].iloc[-1]
+current_inventory = sim_levels[-1]
 days_of_cover = current_inventory / avg_daily if avg_daily > 0 else np.nan
 
 future_dates, forecast_vals, resid_std = forecast_demand(sub, forecast_horizon)
@@ -413,6 +483,22 @@ fig.add_hline(y=reorder_point, line_dash="dot", line_color="#B23A20",
 fig.update_layout(height=400, margin=dict(l=10, r=10, t=10, b=10),
                    plot_bgcolor="white", paper_bgcolor="white", legend=dict(orientation="h", y=1.1))
 st.plotly_chart(fig, use_container_width=True)
+
+st.markdown(f"**Simulated inventory position under an assumed reorder policy** (s={reorder_point:.0f}, S={order_up_to:.0f})")
+st.caption(
+    "This is NOT the source file's inventory column - it's what stock on hand would look like if this SKU's "
+    "real demand history were managed under a standard reorder-point policy, since the source data's own "
+    "inventory fields don't reliably reflect a real depleting/replenishing balance (see limitations below)."
+)
+fig2 = go.Figure()
+fig2.add_trace(go.Scatter(x=sub["Date"], y=sub["Simulated Inventory"], name="Simulated inventory",
+                           line=dict(color="#2C6E63", width=1.5), fill="tozeroy", fillcolor="rgba(44,110,99,0.10)"))
+fig2.add_hline(y=reorder_point, line_dash="dot", line_color="#B23A20",
+               annotation_text="Reorder point (s)", annotation_position="top left")
+fig2.add_hline(y=order_up_to, line_dash="dash", line_color="#8891A0",
+               annotation_text="Order-up-to (S)", annotation_position="top left")
+fig2.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="white", paper_bgcolor="white")
+st.plotly_chart(fig2, use_container_width=True)
 
 # ----------------------------------------------------------------------------
 # 8. Plain-English recommendation (this is the part a manager actually reads)
@@ -454,10 +540,10 @@ st.markdown("#### Recommendation")
 st.info("\n\n".join(lines))
 
 st.caption(
-    f"Inventory source for this SKU: **{sub['Inventory Method'].iloc[-1]}**. "
     "Limitations / assumptions: reorder point assumes stationary (non-seasonal) daily demand and fixed lead time; "
     "$ estimates use an assumed or averaged unit cost and a flat stockout-cost multiplier rather than true margin data; "
-    "the app tries to reconstruct a real depleting inventory balance from Units Sold/Units Ordered rather than "
-    "trusting a raw 'Inventory Level' column blindly, but automatically falls back to the raw column (flagged above) "
-    "if that reconstruction doesn't behave like real inventory for a given dataset."
+    "the inventory chart above is simulated from an assumed reorder policy applied to real demand, not read from the "
+    "source file, because the source file's inventory/replenishment columns did not reliably behave like a real "
+    "depleting stock balance (checked directly - see design notes in the code); only one purchase order is modeled "
+    "in transit at a time."
 )
