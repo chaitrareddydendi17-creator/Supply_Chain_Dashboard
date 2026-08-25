@@ -10,9 +10,30 @@ Deploy for free (shareable link):
     2. Go to https://share.streamlit.io -> "New app" -> pick your repo
     3. You'll get a live URL like https://yourname-supplychain.streamlit.app
 
-Expected CSV columns (matches the Kaggle "Retail Store Inventory
-Forecasting Dataset"): Date, Store ID, Product ID, Units Sold,
-Inventory Level, Units Ordered  (Category/Region optional)
+Works with (almost) any retail/inventory CSV. On upload, the app asks
+you to confirm which of your columns map to Date / Store / Product /
+Units Sold / etc. Only Date, Store, Product, and Units Sold are
+required - everything else is optional and the app degrades gracefully
+if it's missing.
+
+Design notes (why this file is built the way it is - kept as comments
+so this reads like reasoning, not just code):
+
+  * "Inventory Level" columns in most public retail datasets (incl. the
+    Kaggle "Retail Store Inventory Forecasting Dataset") are generated
+    independently of Units Sold / Units Ordered - they don't actually
+    behave like a depleting stock balance. Trusting that column directly
+    causes nonsense reorder signals (e.g. every SKU flagged "reorder now").
+    So we IGNORE the raw inventory column for decision-making and instead
+    simulate a running balance from Units Sold / Units Ordered, seeded
+    from the raw column's first value if available. See simulate_inventory().
+
+  * "Demand forecasting" needs an actual forward-looking prediction, not
+    just a trailing moving average. See forecast_demand() - a simple,
+    explainable weekly-seasonality + exponential smoothing forecast.
+    Deliberately NOT using a black-box model: a supply chain audience
+    trusts simple/explainable methods more than opaque ones, and the
+    story here is business judgment, not ML sophistication.
 """
 
 import streamlit as st
@@ -23,22 +44,52 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="Supply Chain Dashboard", layout="wide")
 
 # ----------------------------------------------------------------------------
-# Data loading
+# 1. Column mapping - makes the app work with (almost) any dataset
 # ----------------------------------------------------------------------------
+CANDIDATE_COLUMNS = {
+    "Date": ["date", "order date", "week", "day", "period"],
+    "Store ID": ["store id", "store", "location", "shop", "outlet", "warehouse"],
+    "Product ID": ["product id", "product", "sku", "item id", "item"],
+    "Units Sold": ["units sold", "sales", "demand", "qty sold", "quantity sold", "sold", "sales qty"],
+    "Inventory Level": ["inventory level", "inventory", "stock", "on hand", "stock level", "on-hand"],
+    "Units Ordered": ["units ordered", "ordered", "replenishment", "reorder qty", "purchase qty", "po qty"],
+    "Category": ["category", "product category", "type", "segment"],
+    "Price": ["price", "unit price", "selling price", "unit cost", "cost"],
+}
+REQUIRED_FIELDS = ["Date", "Store ID", "Product ID", "Units Sold"]
+OPTIONAL_FIELDS = ["Inventory Level", "Units Ordered", "Category", "Price"]
+
+
+def guess_column(canonical_name, actual_columns):
+    """Best-effort auto-match of a canonical field to an uploaded column name."""
+    candidates = CANDIDATE_COLUMNS[canonical_name]
+    lowered = {c: c.lower().strip() for c in actual_columns}
+    for cand in candidates:
+        for col, low in lowered.items():
+            if low == cand:
+                return col
+    for cand in candidates:
+        for col, low in lowered.items():
+            if cand in low:
+                return col
+    return None
+
+
 @st.cache_data
 def generate_demo_data():
+    """Synthetic fallback dataset so the app is never blank on first load."""
     rng = np.random.default_rng(42)
     stores = ["Store A", "Store B"]
     products = [
-        ("Widget X", "Hardware", 28, 420, 260),
-        ("Widget Y", "Hardware", 16, 260, 180),
-        ("Gadget Z", "Electronics", 40, 520, 320),
-        ("Gadget W", "Electronics", 12, 200, 150),
+        ("Widget X", "Hardware", 28, 420, 260, 18.0),
+        ("Widget Y", "Hardware", 16, 260, 180, 24.5),
+        ("Gadget Z", "Electronics", 40, 520, 320, 42.0),
+        ("Gadget W", "Electronics", 12, 200, 150, 89.0),
     ]
     dates = pd.date_range("2026-02-06", periods=180, freq="D")
     rows = []
     for store in stores:
-        for name, cat, base, cap, restock in products:
+        for name, cat, base, cap, restock, price in products:
             inventory = cap
             for d in dates:
                 weekend_bump = 1.25 if d.dayofweek >= 5 else 1.0
@@ -50,13 +101,79 @@ def generate_demo_data():
                 if inventory < restock * 0.4:
                     units_ordered = restock + rng.integers(0, 60)
                     inventory += units_ordered
-                rows.append([d, store, name, cat, units_sold, inventory, units_ordered])
+                rows.append([d, store, name, cat, units_sold, inventory, units_ordered, price])
     return pd.DataFrame(rows, columns=[
         "Date", "Store ID", "Product ID", "Category",
-        "Units Sold", "Inventory Level", "Units Ordered"
+        "Units Sold", "Inventory Level", "Units Ordered", "Price"
     ])
 
 
+st.sidebar.header("Data")
+uploaded = st.sidebar.file_uploader("Upload your CSV", type=["csv"])
+
+if uploaded is not None:
+    raw = pd.read_csv(uploaded)
+    is_demo = False
+
+    st.sidebar.subheader("Map your columns")
+    st.sidebar.caption("Auto-detected where possible - check these are right.")
+    mapping = {}
+    actual_cols = list(raw.columns)
+    for field in REQUIRED_FIELDS:
+        guess = guess_column(field, actual_cols)
+        idx = actual_cols.index(guess) if guess in actual_cols else 0
+        mapping[field] = st.sidebar.selectbox(f"{field} *", actual_cols, index=idx, key=f"map_{field}")
+    for field in OPTIONAL_FIELDS:
+        guess = guess_column(field, actual_cols)
+        options = ["(none)"] + actual_cols
+        idx = options.index(guess) if guess in actual_cols else 0
+        choice = st.sidebar.selectbox(field, options, index=idx, key=f"map_{field}")
+        mapping[field] = None if choice == "(none)" else choice
+
+    df = pd.DataFrame()
+    for canonical, source_col in mapping.items():
+        if source_col is not None:
+            df[canonical] = raw[source_col]
+    df["Date"] = pd.to_datetime(df["Date"])
+    for opt_col in ["Inventory Level", "Units Ordered", "Category", "Price"]:
+        if opt_col not in df.columns:
+            df[opt_col] = np.nan
+else:
+    df = generate_demo_data()
+    is_demo = True
+    st.sidebar.info("Showing simulated demo data - upload a CSV to use your own.")
+
+has_price = df["Price"].notna().any()
+
+# ----------------------------------------------------------------------------
+# 2. Sidebar controls / assumptions
+# ----------------------------------------------------------------------------
+st.sidebar.header("Filters")
+store = st.sidebar.selectbox("Store", sorted(df["Store ID"].unique()))
+products_in_store = sorted(df[df["Store ID"] == store]["Product ID"].unique())
+product = st.sidebar.selectbox("Product", products_in_store)
+
+st.sidebar.header("Assumptions")
+lead_time = st.sidebar.number_input("Lead time (days)", min_value=1, max_value=60, value=5)
+service_z = st.sidebar.selectbox(
+    "Service level", [1.28, 1.65, 2.05],
+    format_func=lambda z: f"{z} (~{'90%' if z == 1.28 else '95%' if z == 1.65 else '98%'})",
+    index=1,
+)
+forecast_horizon = st.sidebar.slider("Forecast horizon (days)", 7, 60, 30)
+
+st.sidebar.subheader("Cost assumptions")
+st.sidebar.caption("Used for $ risk estimates - override if you know real figures.")
+default_unit_cost = float(df["Price"].dropna().mean()) if has_price else 25.0
+unit_cost = st.sidebar.number_input("Assumed unit cost ($)", min_value=0.1, value=round(default_unit_cost, 2))
+holding_rate = st.sidebar.slider("Annual holding cost rate (% of unit cost)", 5, 40, 20) / 100
+stockout_margin_multiplier = st.sidebar.slider(
+    "Stockout cost multiplier (x unit cost, lost-sale + goodwill)", 1.0, 5.0, 2.0
+)
+
+# ----------------------------------------------------------------------------
+# 3. Core calculations
+# ----------------------------------------------------------------------------
 def robust_stats(series):
     """Mean/std that ignore extreme spikes (e.g. promo days, holiday surges)
     so a handful of outlier days don't blow up the safety-stock formula."""
@@ -68,92 +185,160 @@ def robust_stats(series):
     return clipped.mean(), clipped.std()
 
 
-st.sidebar.header("Data")
-uploaded = st.sidebar.file_uploader("Upload your CSV", type=["csv"])
+def simulate_inventory(sub):
+    """Recompute a running inventory balance from Units Sold / Units Ordered
+    instead of trusting a raw 'Inventory Level' column, since in many public
+    datasets that column is generated independently and doesn't actually
+    track depletion/replenishment.
 
-if uploaded is not None:
-    df = pd.read_csv(uploaded)
-    df["Date"] = pd.to_datetime(df["Date"])
-    is_demo = False
-else:
-    df = generate_demo_data()
-    is_demo = True
-    st.sidebar.info("Showing simulated demo data — upload a CSV to use your own.")
+    This is only valid if Units Ordered in the source data actually behaves
+    like real restocking (i.e. roughly offsets Units Sold over time). If it
+    doesn't - e.g. it's sparse or independently-random noise, as can happen
+    in synthetic Kaggle-style datasets - the cumulative balance will just
+    collapse to 0 for almost every SKU, which is a different-looking but
+    equally broken signal. So: build the simulation, then check whether it
+    actually behaves like inventory before trusting it. If it doesn't, fall
+    back to the raw column and say so explicitly rather than silently
+    presenting a confident-looking but meaningless number."""
+    sub = sub.sort_values("Date").copy()
+    has_raw = sub["Inventory Level"].notna().any()
+    start = sub["Inventory Level"].dropna().iloc[0] if has_raw else sub["Units Sold"].mean() * 14
+    units_ordered = sub["Units Ordered"].fillna(0)
+    net_change = units_ordered - sub["Units Sold"].fillna(0)
+    simulated = (start + net_change.cumsum()).clip(lower=0)
+
+    frac_at_floor = (simulated == 0).mean()
+    if has_raw and frac_at_floor > 0.5:
+        # Simulation collapsed to the zero floor for most of the history -
+        # Units Ordered isn't tracking real replenishment in this dataset.
+        # Trust the raw column instead, but flag it as unverified.
+        sub["Simulated Inventory"] = sub["Inventory Level"]
+        sub["Inventory Method"] = "raw column (unverified - replenishment data looked inconsistent)"
+    elif has_raw:
+        sub["Simulated Inventory"] = simulated
+        sub["Inventory Method"] = "simulated from Units Sold / Units Ordered"
+    else:
+        sub["Simulated Inventory"] = simulated
+        sub["Inventory Method"] = "simulated (no raw inventory column in source data)"
+    return sub
+
+
+def forecast_demand(sub, horizon):
+    """Simple, explainable forecast: weekly-seasonality factors applied on
+    top of exponentially-smoothed demand level. Not a black-box model -
+    deliberately chosen so the method is easy to explain in an interview."""
+    d = sub[["Date", "Units Sold"]].dropna()
+    if len(d) < 14:
+        last_val = d["Units Sold"].mean() if len(d) else 0
+        future_dates = pd.date_range(sub["Date"].max() + pd.Timedelta(days=1), periods=horizon)
+        return future_dates, np.full(horizon, last_val), d["Units Sold"].std() or 0
+
+    d = d.copy()
+    d["dow"] = d["Date"].dt.dayofweek
+    overall_mean = d["Units Sold"].mean() or 1
+    dow_factor = (d.groupby("dow")["Units Sold"].mean() / overall_mean).to_dict()
+
+    alpha = 0.3
+    level = d["Units Sold"].iloc[0] / dow_factor.get(d["dow"].iloc[0], 1.0)
+    fitted = []
+    for _, row in d.iterrows():
+        deseasoned = row["Units Sold"] / dow_factor.get(row["dow"], 1.0)
+        level = alpha * deseasoned + (1 - alpha) * level
+        fitted.append(level * dow_factor.get(row["dow"], 1.0))
+    residual_std = (d["Units Sold"] - pd.Series(fitted, index=d.index)).std()
+
+    future_dates = pd.date_range(sub["Date"].max() + pd.Timedelta(days=1), periods=horizon)
+    forecast_vals = [level * dow_factor.get(dt.dayofweek, 1.0) for dt in future_dates]
+    return future_dates, np.array(forecast_vals), (residual_std if not np.isnan(residual_std) else 0)
+
+
+@st.cache_data(show_spinner=False)
+def compute_all_sku_metrics(df, lead_time, service_z, unit_cost_default, holding_rate, stockout_mult, has_price):
+    """One pass over every Store/Product combo - powers the portfolio view."""
+    rows = []
+    for (s, p), grp in df.groupby(["Store ID", "Product ID"]):
+        grp = simulate_inventory(grp)
+        avg_daily, std_daily = robust_stats(grp["Units Sold"])
+        safety_stock = service_z * (std_daily or 0) * np.sqrt(lead_time)
+        reorder_point = avg_daily * lead_time + safety_stock
+        current_inv = grp["Simulated Inventory"].iloc[-1]
+        days_of_cover = current_inv / avg_daily if avg_daily > 0 else np.nan
+
+        if avg_daily > 0:
+            days_to_breach = max((current_inv - reorder_point) / avg_daily, 0)
+        else:
+            days_to_breach = np.nan
+
+        if current_inv <= reorder_point:
+            status = "Reorder now"
+        elif current_inv <= reorder_point * 1.25:
+            status = "Watch"
+        else:
+            status = "OK"
+
+        cv = (std_daily / avg_daily) if avg_daily > 0 else 0
+        variability_tag = "X (steady)" if cv < 0.5 else ("Y (moderate)" if cv < 1.0 else "Z (volatile)")
+
+        sku_price = grp["Price"].dropna().mean() if grp["Price"].notna().any() else unit_cost_default
+        annual_revenue_proxy = avg_daily * 365 * sku_price
+
+        holding_cost = safety_stock * sku_price * holding_rate
+        shortfall = max(reorder_point - current_inv, 0)
+        stockout_cost_estimate = shortfall * sku_price * stockout_mult if status != "OK" else 0.0
+
+        rows.append({
+            "Store ID": s, "Product ID": p, "Category": grp["Category"].dropna().iloc[0] if grp["Category"].notna().any() else "-",
+            "Avg Daily Demand": avg_daily, "Demand Std": std_daily, "CV": cv, "Variability (XYZ)": variability_tag,
+            "Safety Stock": safety_stock, "Reorder Point": reorder_point,
+            "Current Inventory": current_inv, "Days of Cover": days_of_cover, "Days to Reorder Breach": days_to_breach,
+            "Status": status, "Unit Price ($)": sku_price, "Annual Revenue Proxy ($)": annual_revenue_proxy,
+            "Holding Cost/yr ($)": holding_cost, "Est. Stockout Cost ($)": stockout_cost_estimate,
+        })
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values("Annual Revenue Proxy ($)", ascending=False).reset_index(drop=True)
+    out["Cum Revenue %"] = out["Annual Revenue Proxy ($)"].cumsum() / out["Annual Revenue Proxy ($)"].sum() * 100
+    out["Value Tier (ABC)"] = np.where(out["Cum Revenue %"] <= 80, "A",
+                                 np.where(out["Cum Revenue %"] <= 95, "B", "C"))
+    out["Segment"] = out["Value Tier (ABC)"] + out["Variability (XYZ)"].str[0]
+    return out
+
+
+portfolio = compute_all_sku_metrics(df, lead_time, service_z, unit_cost, holding_rate, stockout_margin_multiplier, has_price)
 
 # ----------------------------------------------------------------------------
-# Sidebar controls
-# ----------------------------------------------------------------------------
-st.sidebar.header("Filters")
-store = st.sidebar.selectbox("Store", sorted(df["Store ID"].unique()))
-products_in_store = sorted(df[df["Store ID"] == store]["Product ID"].unique())
-product = st.sidebar.selectbox("Product", products_in_store)
-
-st.sidebar.header("Assumptions")
-lead_time = st.sidebar.number_input("Lead time (days)", min_value=1, max_value=30, value=5)
-service_z = st.sidebar.selectbox("Service level", [1.28, 1.65, 2.05],
-                                  format_func=lambda z: f"{z} (~{'90%' if z==1.28 else '95%' if z==1.65 else '98%'})",
-                                  index=1)
-
-# ----------------------------------------------------------------------------
-# Compute KPIs for selected store/product
-# ----------------------------------------------------------------------------
-sub = df[(df["Store ID"] == store) & (df["Product ID"] == product)].sort_values("Date")
-sub["MA_7"] = sub["Units Sold"].rolling(7).mean()
-sub["MA_30"] = sub["Units Sold"].rolling(30).mean()
-
-avg_daily, std_daily = robust_stats(sub["Units Sold"])
-safety_stock = service_z * std_daily * np.sqrt(lead_time)
-reorder_point = avg_daily * lead_time + safety_stock
-current_inventory = sub["Inventory Level"].iloc[-1] if "Inventory Level" in sub else np.nan
-days_of_cover = current_inventory / avg_daily if avg_daily > 0 else np.nan
-
-# ----------------------------------------------------------------------------
-# Layout
+# 4. Layout - header KPIs for the whole network
 # ----------------------------------------------------------------------------
 st.title("Demand & Inventory Dashboard")
-st.caption("Supply chain analytics — demand forecasting, safety stock & reorder points")
+st.caption("Supply chain analytics - demand forecasting, safety stock, reorder points & $ risk")
+if not has_price:
+    st.caption(f"No price column found - using an assumed unit cost of ${unit_cost:,.2f} for all $ estimates (editable in the sidebar).")
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Avg Daily Demand", f"{avg_daily:.1f}")
-c2.metric("Demand Volatility (σ)", f"{std_daily:.1f}")
-c3.metric("Safety Stock", f"{safety_stock:.0f}")
-c4.metric("Reorder Point", f"{reorder_point:.0f}")
-c5.metric("Days of Cover", f"{days_of_cover:.1f}",
-          delta=None if pd.isna(days_of_cover) else f"{'below' if days_of_cover < lead_time else 'ok'} lead time")
+n_reorder = (portfolio["Status"] == "Reorder now").sum()
+n_watch = (portfolio["Status"] == "Watch").sum()
+total_stockout_risk = portfolio["Est. Stockout Cost ($)"].sum()
+total_holding_cost = portfolio["Holding Cost/yr ($)"].sum()
 
-st.subheader(f"{product} — {store} — daily demand")
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=sub["Date"], y=sub["Units Sold"], name="Actual",
-                          line=dict(color="#8891A0", width=1), opacity=0.5))
-fig.add_trace(go.Scatter(x=sub["Date"], y=sub["MA_7"], name="7-day avg",
-                          line=dict(color="#2C6E63", width=2)))
-fig.add_trace(go.Scatter(x=sub["Date"], y=sub["MA_30"], name="30-day avg",
-                          line=dict(color="#28344A", width=2, dash="dash")))
-fig.add_hline(y=reorder_point, line_dash="dot", line_color="#B23A20",
-              annotation_text="Reorder point", annotation_position="top left")
-fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10),
-                   plot_bgcolor="white", paper_bgcolor="white")
-st.plotly_chart(fig, use_container_width=True)
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("SKUs needing reorder now", int(n_reorder))
+k2.metric("SKUs to watch", int(n_watch))
+k3.metric("Est. stockout $ at risk", f"${total_stockout_risk:,.0f}")
+k4.metric("Annual safety-stock holding cost", f"${total_holding_cost:,.0f}")
 
 # ----------------------------------------------------------------------------
-# Inventory runway across all products in the selected store
+# 5. Portfolio view - what to look at first, across the whole network
 # ----------------------------------------------------------------------------
-st.subheader(f"Inventory runway — {store}")
+st.subheader("Portfolio priority view - all SKUs, ranked by urgency")
+st.caption("Sorted by estimated $ at risk. A/B/C = share of revenue. X/Y/Z = demand steadiness (X=steady, Z=volatile).")
 
-runway_rows = []
-for p in products_in_store:
-    p_df = df[(df["Store ID"] == store) & (df["Product ID"] == p)].sort_values("Date")
-    p_avg, p_std = robust_stats(p_df["Units Sold"])
-    p_ss = service_z * p_std * np.sqrt(lead_time)
-    p_rop = p_avg * lead_time + p_ss
-    p_current = p_df["Inventory Level"].iloc[-1] if "Inventory Level" in p_df else np.nan
-    status = "Reorder now" if p_current <= p_rop else ("Watch" if p_current <= p_rop * 1.25 else "OK")
-    runway_rows.append({
-        "Product": p, "Current Inventory": int(round(p_current, 0)),
-        "Reorder Point": int(round(p_rop, 0)), "Status": status
-    })
-
-runway_df = pd.DataFrame(runway_rows)
+priority = portfolio.sort_values(["Est. Stockout Cost ($)", "Status"], ascending=[False, True])
+display_cols = ["Store ID", "Product ID", "Category", "Segment", "Status",
+                 "Current Inventory", "Reorder Point", "Days to Reorder Breach", "Est. Stockout Cost ($)"]
+show = priority[display_cols].copy()
+show["Current Inventory"] = show["Current Inventory"].round(0).astype(int)
+show["Reorder Point"] = show["Reorder Point"].round(0).astype(int)
+show["Days to Reorder Breach"] = show["Days to Reorder Breach"].round(1)
+show["Est. Stockout Cost ($)"] = show["Est. Stockout Cost ($)"].round(0)
 
 
 def highlight_status(row):
@@ -166,6 +351,113 @@ def highlight_status(row):
     return [f"background-color: {bg}; color: {text}; font-weight: 500"] * len(row)
 
 
-st.dataframe(runway_df.style.apply(highlight_status, axis=1), use_container_width=True, hide_index=True)
+st.dataframe(show.head(15).style.apply(highlight_status, axis=1), use_container_width=True, hide_index=True)
+st.caption("Red = place a purchase order now. Amber = approaching reorder point. Green = healthy stock. Showing top 15 by $ at risk.")
 
-st.caption("Red = place a purchase order now. Amber = approaching reorder point. Green = healthy stock.")
+# ----------------------------------------------------------------------------
+# 6. ABC/XYZ segmentation summary
+# ----------------------------------------------------------------------------
+st.subheader("ABC/XYZ segmentation")
+st.caption("A = top ~80% of revenue, B = next ~15%, C = remaining ~5%. X = steady demand, Y = moderate, Z = volatile. "
+           "AZ/BZ SKUs are the highest-risk to manage on a flat reorder rule and deserve tighter, more frequent review.")
+seg_summary = portfolio.groupby("Segment").agg(
+    SKUs=("Product ID", "count"),
+    Avg_CV=("CV", "mean"),
+    Total_Revenue_Proxy=("Annual Revenue Proxy ($)", "sum"),
+).reset_index().sort_values("Total_Revenue_Proxy", ascending=False)
+seg_summary["Total_Revenue_Proxy"] = seg_summary["Total_Revenue_Proxy"].round(0)
+seg_summary["Avg_CV"] = seg_summary["Avg_CV"].round(2)
+st.dataframe(seg_summary, use_container_width=True, hide_index=True)
+
+# ----------------------------------------------------------------------------
+# 7. Single-SKU detail view (with forecast)
+# ----------------------------------------------------------------------------
+st.divider()
+st.subheader(f"{product} - {store} - detail view")
+
+sub = df[(df["Store ID"] == store) & (df["Product ID"] == product)].sort_values("Date")
+sub = simulate_inventory(sub)
+sub["MA_7"] = sub["Units Sold"].rolling(7).mean()
+
+avg_daily, std_daily = robust_stats(sub["Units Sold"])
+safety_stock = service_z * (std_daily or 0) * np.sqrt(lead_time)
+reorder_point = avg_daily * lead_time + safety_stock
+current_inventory = sub["Simulated Inventory"].iloc[-1]
+days_of_cover = current_inventory / avg_daily if avg_daily > 0 else np.nan
+
+future_dates, forecast_vals, resid_std = forecast_demand(sub, forecast_horizon)
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Avg Daily Demand", f"{avg_daily:.1f}")
+c2.metric("Demand Volatility (σ)", f"{std_daily:.1f}")
+c3.metric("Safety Stock", f"{safety_stock:.0f}")
+c4.metric("Reorder Point", f"{reorder_point:.0f}")
+c5.metric("Days of Cover", f"{days_of_cover:.1f}",
+          delta=None if pd.isna(days_of_cover) else f"{'below' if days_of_cover < lead_time else 'ok'} lead time")
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=sub["Date"], y=sub["Units Sold"], name="Actual",
+                          line=dict(color="#8891A0", width=1), opacity=0.5))
+fig.add_trace(go.Scatter(x=sub["Date"], y=sub["MA_7"], name="7-day avg",
+                          line=dict(color="#2C6E63", width=2)))
+fig.add_trace(go.Scatter(x=future_dates, y=forecast_vals, name=f"{forecast_horizon}-day forecast",
+                          line=dict(color="#28344A", width=2, dash="dash")))
+fig.add_trace(go.Scatter(
+    x=list(future_dates) + list(future_dates[::-1]),
+    y=list(forecast_vals + resid_std) + list((forecast_vals - resid_std)[::-1]),
+    fill="toself", fillcolor="rgba(40,52,74,0.12)", line=dict(color="rgba(0,0,0,0)"),
+    name="Forecast uncertainty", hoverinfo="skip",
+))
+fig.add_hline(y=reorder_point, line_dash="dot", line_color="#B23A20",
+              annotation_text="Reorder point", annotation_position="top left")
+fig.update_layout(height=400, margin=dict(l=10, r=10, t=10, b=10),
+                   plot_bgcolor="white", paper_bgcolor="white", legend=dict(orientation="h", y=1.1))
+st.plotly_chart(fig, use_container_width=True)
+
+# ----------------------------------------------------------------------------
+# 8. Plain-English recommendation (this is the part a manager actually reads)
+# ----------------------------------------------------------------------------
+sku_row = portfolio[(portfolio["Store ID"] == store) & (portfolio["Product ID"] == product)].iloc[0]
+
+lines = []
+lines.append(
+    f"**{product} at {store}** sells an average of **{avg_daily:.0f} units/day** "
+    f"(volatility σ={std_daily:.0f}, CV={sku_row['CV']:.2f} -> classified **{sku_row['Variability (XYZ)']}**, "
+    f"value tier **{sku_row['Value Tier (ABC)']}**)."
+)
+if sku_row["Status"] == "Reorder now":
+    lines.append(
+        f"Current simulated inventory is **{current_inventory:.0f} units**, already below the reorder point of "
+        f"**{reorder_point:.0f} units**. Recommend placing a purchase order now for at least "
+        f"**{max(reorder_point - current_inventory, 0):.0f} units** to restore cover, given a {lead_time}-day lead time. "
+        f"Estimated stockout exposure if unaddressed: **${sku_row['Est. Stockout Cost ($)']:,.0f}**."
+    )
+elif sku_row["Status"] == "Watch":
+    lines.append(
+        f"Current simulated inventory is **{current_inventory:.0f} units**, within 25% of the reorder point "
+        f"(**{reorder_point:.0f} units**). At current demand, this SKU crosses its reorder point in "
+        f"roughly **{sku_row['Days to Reorder Breach']:.0f} days** - recommend queuing a purchase order now "
+        f"so it lands before the breach, given a {lead_time}-day lead time."
+    )
+else:
+    lines.append(
+        f"Current simulated inventory is **{current_inventory:.0f} units**, comfortably above the reorder point "
+        f"(**{reorder_point:.0f} units**), giving roughly **{days_of_cover:.0f} days of cover**. No action needed."
+    )
+if sku_row["Variability (XYZ)"].startswith("Z"):
+    lines.append(
+        "This SKU's demand is highly volatile - a flat safety-stock formula understates real risk here. "
+        "Consider reviewing it more frequently than steadier SKUs, or holding extra buffer beyond the formula."
+    )
+
+st.markdown("#### Recommendation")
+st.info("\n\n".join(lines))
+
+st.caption(
+    f"Inventory source for this SKU: **{sub['Inventory Method'].iloc[-1]}**. "
+    "Limitations / assumptions: reorder point assumes stationary (non-seasonal) daily demand and fixed lead time; "
+    "$ estimates use an assumed or averaged unit cost and a flat stockout-cost multiplier rather than true margin data; "
+    "the app tries to reconstruct a real depleting inventory balance from Units Sold/Units Ordered rather than "
+    "trusting a raw 'Inventory Level' column blindly, but automatically falls back to the raw column (flagged above) "
+    "if that reconstruction doesn't behave like real inventory for a given dataset."
+)
